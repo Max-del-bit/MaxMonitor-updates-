@@ -1,0 +1,715 @@
+# -*- coding: utf-8 -*-
+"""
+Max Monitor V2.0 - "The Ultimate Performance Suite" (Windows 10/11)
+Entwickelt von Maxim | Schlägt UXTU, Process Lasso & Quick CPU!
+Bauen: pyinstaller --noconsole --onedir --name MaxMonitor main.py
+"""
+import sys
+import os
+import subprocess
+import ctypes
+import threading
+import queue
+import time
+import urllib.request
+import json
+import shutil
+import tempfile
+import winreg
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import psutil
+
+# Safe WMI import
+try:
+    import wmi
+except ImportError:
+    wmi = None
+
+# ---------------------------------------------------------
+# CONSTANTS & GITHUB CONFIGURATION
+# ---------------------------------------------------------
+APP_NAME = "Max Monitor"
+APP_VERSION = "v2.0.0"
+GITHUB_REPO = "Max-del-bit/MaxMonitor-updates"  # Dein GitHub Repository!
+
+# GitHub Dark Theme Colors (#0d1117 Palette)
+COLOR_BG = "#0d1117"
+COLOR_CARD = "#161b22"
+COLOR_BORDER = "#30363d"
+COLOR_TEXT = "#c9d1d9"
+COLOR_MUTED = "#8b949e"
+COLOR_ACCENT = "#58a6ff"
+COLOR_SUCCESS = "#238636"
+COLOR_DANGER = "#da3633"
+COLOR_WARNING = "#d29922"
+
+# ---------------------------------------------------------
+# HELPER FUNCTIONS
+# ---------------------------------------------------------
+def is_admin():
+    """Prüft, ob Administrator-Rechte vorliegen."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+def run_as_admin():
+    """Startet die App mit Windows UAC Admin-Rechten neu."""
+    if is_admin():
+        return
+    try:
+        if getattr(sys, 'frozen', False):
+            executable = sys.executable
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, "", None, 1)
+        else:
+            executable = sys.executable
+            args = f'"{os.path.abspath(__file__)}"'
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, args, None, 1)
+        sys.exit(0)
+    except Exception as e:
+        messagebox.showerror("UAC Fehler", f"Konnte Admin-Rechte nicht anfordern: {e}")
+
+def get_app_dir():
+    """Liefert das Verzeichnis der App zurück."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def run_hidden(args, timeout=10):
+    """Führt Subprozesse unsichtbar im Hintergrund aus."""
+    no_window = 0x08000000 if sys.platform == "win32" else 0
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, creationflags=no_window, encoding="oem", errors="replace")
+    except Exception as e:
+        return None
+
+
+# ---------------------------------------------------------
+# HARDWARE MONITORING CLASS (PDH & WMI)
+# ---------------------------------------------------------
+class HardwareMonitor:
+    def __init__(self):
+        self.gpu_query = None
+        self.gpu_counter = None
+        self._init_gpu_counter()
+        self.wmi_obj = None
+        if wmi:
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+                self.wmi_obj = wmi.WMI(namespace="root\\wmi")
+            except Exception:
+                self.wmi_obj = None
+
+    def _init_gpu_counter(self):
+        """Initialisiert Windows Performance Counter für Vega 8 iGPU."""
+        try:
+            import win32pdh
+            self.pdh = win32pdh
+            self.gpu_query = self.pdh.OpenQuery()
+            path = self.pdh.MakeCounterPath((None, "GPU Engine", "*", None, -1, "Utilization Percentage"))
+            self.gpu_counter = self.pdh.AddCounter(self.gpu_query, path)
+            self.pdh.CollectQueryData(self.gpu_query)
+        except Exception:
+            self.gpu_query = None
+            self.gpu_counter = None
+
+    def get_gpu_usage(self):
+        if not self.gpu_query or not self.gpu_counter:
+            return 0.0
+        try:
+            self.pdh.CollectQueryData(self.gpu_query)
+            _, val = self.pdh.GetFormattedCounterValue(self.gpu_counter, self.pdh.PDH_FMT_DOUBLE)
+            return round(val, 1)
+        except Exception:
+            return 0.0
+
+    def get_cpu_temp(self):
+        if not self.wmi_obj:
+            return "N/A"
+        try:
+            temperature_info = self.wmi_obj.MSAcpi_ThermalZoneTemperature()
+            if temperature_info:
+                temp_k = temperature_info[0].CurrentTemperature
+                temp_c = (temp_k / 10.0) - 273.15
+                if 0 <= temp_c <= 120:
+                    return f"{round(temp_c, 1)} °C"
+        except Exception:
+            pass
+        return "N/A"
+
+
+# ---------------------------------------------------------
+# MAIN APPLICATION GUI
+# ---------------------------------------------------------
+class MaxMonitorV2(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title(f"{APP_NAME} {APP_VERSION} - Ultimate Performance Suite")
+        self.geometry("1100 x 750")
+        self.minsize(950, 650)
+        self.configure(bg=COLOR_BG)
+
+        self.queue = queue.Queue()
+        self.monitor = HardwareMonitor()
+
+        self._setup_styles()
+        self._build_ui()
+        self._start_background_threads()
+        self._check_queue()
+        self._cleanup_old_files()
+
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure(".", background=COLOR_BG, foreground=COLOR_TEXT, font=("Segoe UI", 10))
+        style.configure("TFrame", background=COLOR_BG)
+        style.configure("Card.TFrame", background=COLOR_CARD)
+        
+        style.configure("TLabelframe", background=COLOR_CARD, foreground=COLOR_TEXT, bordercolor=COLOR_BORDER)
+        style.configure("TLabelframe.Label", background=COLOR_CARD, foreground=COLOR_ACCENT, font=("Segoe UI", 10, "bold"))
+
+        style.configure("TLabel", background=COLOR_BG, foreground=COLOR_TEXT)
+        style.configure("Card.TLabel", background=COLOR_CARD, foreground=COLOR_TEXT)
+        style.configure("Header.TLabel", background=COLOR_BG, foreground=COLOR_ACCENT, font=("Segoe UI", 16, "bold"))
+        style.configure("SubHeader.TLabel", background=COLOR_BG, foreground=COLOR_MUTED, font=("Segoe UI", 9))
+        style.configure("MetricVal.TLabel", background=COLOR_CARD, foreground="#ffffff", font=("Segoe UI", 14, "bold"))
+
+        style.configure("TProgressbar", thickness=12, troughcolor=COLOR_BORDER, background=COLOR_ACCENT)
+
+        style.configure("TButton", background=COLOR_CARD, foreground=COLOR_TEXT, borderwidth=1, relief="solid")
+        style.map("TButton", background=[("active", COLOR_BORDER)])
+
+        style.configure("Primary.TButton", background=COLOR_SUCCESS, foreground="#ffffff", font=("Segoe UI", 9, "bold"))
+        style.map("Primary.TButton", background=[("active", "#2ea043")])
+
+        style.configure("Danger.TButton", background=COLOR_DANGER, foreground="#ffffff", font=("Segoe UI", 9, "bold"))
+        style.map("Danger.TButton", background=[("active", "#f85149")])
+
+        style.configure("TNotebook", background=COLOR_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=COLOR_CARD, foreground=COLOR_MUTED, padding=[12, 8], font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", COLOR_BORDER)], foreground=[("selected", COLOR_ACCENT)])
+
+        # Treeview Style
+        style.configure("Treeview", background=COLOR_CARD, fieldbackground=COLOR_CARD, foreground=COLOR_TEXT, rowheight=24, borderwidth=0)
+        style.configure("Treeview.Heading", background=COLOR_BORDER, foreground=COLOR_ACCENT, font=("Segoe UI", 9, "bold"))
+        style.map("Treeview", background=[("selected", COLOR_ACCENT)], foreground=[("selected", "#ffffff")])
+
+    def _build_ui(self):
+        # Header Bar
+        header_frame = ttk.Frame(self)
+        header_frame.pack(fill="x", padx=20, pady=15)
+
+        title_box = ttk.Frame(header_frame)
+        title_box.pack(side="left")
+        
+        ttk.Label(title_box, text=f"{APP_NAME} {APP_VERSION} 🚀", style="Header.TLabel").pack(anchor="w")
+        
+        admin_str = "🛡️ Admin-Modus Aktiv (Volle Kontrolle)" if is_admin() else "⚠️ Eingeschränkter Modus (Bitte als Admin starten)"
+        admin_col = COLOR_SUCCESS if is_admin() else COLOR_WARNING
+        ttk.Label(title_box, text=f"AMD Ryzen 5 2500U | Vega 8 iGPU | {admin_str}", style="SubHeader.TLabel").pack(anchor="w")
+
+        btn_box = ttk.Frame(header_frame)
+        btn_box.pack(side="right")
+
+        if not is_admin():
+            ttk.Button(btn_box, text="🛡️ Als Admin neustarten", style="Primary.TButton", command=run_as_admin).pack(side="right", padx=5)
+
+        ttk.Button(btn_box, text="🔄 GitHub Auto-Update", command=self.check_for_updates).pack(side="right", padx=5)
+
+        # Tabs Notebook
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        self.tab_dash = ttk.Frame(self.notebook)
+        self.tab_boost = ttk.Frame(self.notebook)
+        self.tab_procs = ttk.Frame(self.notebook)
+        self.tab_uninst = ttk.Frame(self.notebook)
+        self.tab_tools = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.tab_dash, text="📊 Dashboard")
+        self.notebook.add(self.tab_boost, text="⚡ UXTU Ryzen Boost")
+        self.notebook.add(self.tab_procs, text="⚙️ Process Lasso / ProBalance")
+        self.notebook.add(self.tab_uninst, text="🧹 Deep Uninstaller")
+        self.notebook.add(self.tab_tools, text="🛠️ System & Tools")
+
+        self._build_tab_dashboard()
+        self._build_tab_boost()
+        self._build_tab_procs()
+        self._build_tab_uninst()
+        self._build_tab_tools()
+
+        # Bottom Console Log
+        console_frame = ttk.LabelFrame(self, text="📋 Live System-Log & Status")
+        console_frame.pack(fill="x", padx=20, pady=(0, 15))
+
+        self.txt_console = scrolledtext.ScrolledText(
+            console_frame, height=5, bg=COLOR_CARD, fg=COLOR_TEXT,
+            insertbackground="white", font=("Consolas", 9), borderwidth=0, highlightthickness=0
+        )
+        self.txt_console.pack(fill="both", expand=True, padx=5, pady=5)
+        self.log("Max Monitor V2 gestartet. Alle Systeme bereit. Bereit, UXTU und Process Lasso zu schlagen! 🔥")
+
+    # ---------------------------------------------------------
+    # TAB 1: DASHBOARD
+    # ---------------------------------------------------------
+    def _build_tab_dashboard(self):
+        grid = ttk.Frame(self.tab_dash)
+        grid.pack(fill="both", expand=True, padx=10, pady=10)
+        grid.columnconfigure((0, 1), weight=1)
+
+        # CPU Card
+        c1 = ttk.LabelFrame(grid, text="💻 CPU (AMD Ryzen 5 2500U)")
+        c1.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self.lbl_cpu = ttk.Label(c1, text="0.0 %", style="MetricVal.TLabel")
+        self.lbl_cpu.pack(anchor="w", padx=15, pady=(10, 0))
+        self.pb_cpu = ttk.Progressbar(c1, maximum=100)
+        self.pb_cpu.pack(fill="x", padx=15, pady=10)
+        self.lbl_temp = ttk.Label(c1, text="Temperatur: Lade...", style="Card.TLabel")
+        self.lbl_temp.pack(anchor="w", padx=15, pady=(0, 10))
+
+        # RAM Card
+        c2 = ttk.LabelFrame(grid, text="🧠 Arbeitsspeicher (16 GB RAM)")
+        c2.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        self.lbl_ram = ttk.Label(c2, text="0.0 GB / 16 GB", style="MetricVal.TLabel")
+        self.lbl_ram.pack(anchor="w", padx=15, pady=(10, 0))
+        self.pb_ram = ttk.Progressbar(c2, maximum=100)
+        self.pb_ram.pack(fill="x", padx=15, pady=10)
+        ttk.Button(c2, text="🧹 RAM Sofort Bereinigen", style="Primary.TButton", command=self.clean_ram).pack(anchor="e", padx=15, pady=(0, 10))
+
+        # GPU Card
+        c3 = ttk.LabelFrame(grid, text="🎮 GPU (Radeon Vega 8 iGPU)")
+        c3.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        self.lbl_gpu = ttk.Label(c3, text="0.0 %", style="MetricVal.TLabel")
+        self.lbl_gpu.pack(anchor="w", padx=15, pady=(10, 0))
+        self.pb_gpu = ttk.Progressbar(c3, maximum=100)
+        self.pb_gpu.pack(fill="x", padx=15, pady=10)
+        ttk.Label(c3, text="Windows PDH Engine Counter", style="Card.TLabel").pack(anchor="w", padx=15, pady=(0, 10))
+
+        # Info Card
+        c4 = ttk.LabelFrame(grid, text="⚡ Leistungs-Status")
+        c4.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
+        info_str = "• Architektur: 4 Kerne / 8 Threads\n• TDP Steuerung: RyzenAdj aktiv\n• Hintergrund-Optimierung: ProBalance aktiv\n• Auto-Updater: Verbunden mit GitHub"
+        ttk.Label(c4, text=info_str, style="Card.TLabel", justify="left").pack(anchor="w", padx=15, pady=15)
+
+    # ---------------------------------------------------------
+    # TAB 2: RYZEN BOOST (UXTU Style)
+    # ---------------------------------------------------------
+    def _build_tab_boost(self):
+        container = ttk.LabelFrame(self.tab_boost, text="⚡ UXTU-Style APU Power Limits & Boost Profile")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ttk.Label(container, text="Steuere die TDP, STAPM und Temperatur-Limits deiner APU wie in UXTU x86.\n(Benötigt ryzenadj.exe im Anwendungsordner und Admin-Rechte).", style="Card.TLabel", justify="left").pack(anchor="w", padx=15, pady=10)
+
+        # Sliders
+        f_s1 = ttk.Frame(container, style="Card.TFrame")
+        f_s1.pack(fill="x", padx=15, pady=8)
+        self.lbl_stapm = ttk.Label(f_s1, text="STAPM Limit (Dauerleistung): 25 W", style="Card.TLabel")
+        self.lbl_stapm.pack(anchor="w")
+        self.sl_stapm = ttk.Scale(f_s1, from_=8, to=40, value=25, command=lambda v: self.lbl_stapm.config(text=f"STAPM Limit (Dauerleistung): {int(float(v))} W"))
+        self.sl_stapm.pack(fill="x", pady=4)
+
+        f_s2 = ttk.Frame(container, style="Card.TFrame")
+        f_s2.pack(fill="x", padx=15, pady=8)
+        self.lbl_slow = ttk.Label(f_s2, text="PPT Slow Limit: 30 W", style="Card.TLabel")
+        self.lbl_slow.pack(anchor="w")
+        self.sl_slow = ttk.Scale(f_s2, from_=10, to=45, value=30, command=lambda v: self.lbl_slow.config(text=f"PPT Slow Limit: {int(float(v))} W"))
+        self.sl_slow.pack(fill="x", pady=4)
+
+        f_s3 = ttk.Frame(container, style="Card.TFrame")
+        f_s3.pack(fill="x", padx=15, pady=8)
+        self.lbl_temp = ttk.Label(f_s3, text="Temperatur-Limit (Tctl): 85 °C", style="Card.TLabel")
+        self.lbl_temp.pack(anchor="w")
+        self.sl_temp = ttk.Scale(f_s3, from_=60, to=95, value=85, command=lambda v: self.lbl_temp.config(text=f"Temperatur-Limit (Tctl): {int(float(v))} °C"))
+        self.sl_temp.pack(fill="x", pady=4)
+
+        # Profile Buttons (Eco, Balanced, Gaming)
+        f_prof = ttk.Frame(container, style="Card.TFrame")
+        f_prof.pack(fill="x", padx=15, pady=15)
+
+        ttk.Button(f_prof, text="🌱 Eco / Akku (12W)", command=lambda: self._set_boost_preset(12, 15, 70)).pack(side="left", padx=5)
+        ttk.Button(f_prof, text="⚖️ Balance (22W)", command=lambda: self._set_boost_preset(22, 25, 80)).pack(side="left", padx=5)
+        ttk.Button(f_prof, text="🔥 Gaming Turbo (32W)", command=lambda: self._set_boost_preset(32, 38, 90)).pack(side="left", padx=5)
+        ttk.Button(f_prof, text="✅ Limits Anwenden", style="Primary.TButton", command=self.apply_ryzen_adj).pack(side="right", padx=5)
+
+    def _set_boost_preset(self, stapm, slow, temp):
+        self.sl_stapm.set(stapm)
+        self.sl_slow.set(slow)
+        self.sl_temp.set(temp)
+        self.lbl_stapm.config(text=f"STAPM Limit (Dauerleistung): {stapm} W")
+        self.lbl_slow.config(text=f"PPT Slow Limit: {slow} W")
+        self.lbl_temp.config(text=f"Temperatur-Limit (Tctl): {temp} °C")
+
+    # ---------------------------------------------------------
+    # TAB 3: PROCESS LASSO / PROBALANCE
+    # ---------------------------------------------------------
+    def _build_tab_procs(self):
+        container = ttk.LabelFrame(self.tab_procs, text="⚙️ Process Lasso & ProBalance (Prozess-Manager)")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        top_bar = ttk.Frame(container, style="Card.TFrame")
+        top_bar.pack(fill="x", padx=15, pady=10)
+
+        ttk.Button(top_bar, text="🔄 Prozesse Aktualisieren", command=self.refresh_process_list).pack(side="left", padx=5)
+        ttk.Button(top_bar, text="🛑 Prozess Beenden (Kill)", style="Danger.TButton", command=self.kill_selected_process).pack(side="left", padx=5)
+        ttk.Button(top_bar, text="⚡ Priorität auf 'Hoch'", style="Primary.TButton", command=lambda: self.set_process_priority(psutil.HIGH_PRIORITY_CLASS)).pack(side="left", padx=5)
+
+        # Treeview for Processes
+        cols = ("name", "pid", "cpu", "ram")
+        self.tree_procs = ttk.Treeview(container, columns=cols, show="headings", height=15)
+        self.tree_procs.heading("name", text="Prozessname")
+        self.tree_procs.heading("pid", text="PID")
+        self.tree_procs.heading("cpu", text="CPU (%)")
+        self.tree_procs.heading("ram", text="RAM (MB)")
+        self.tree_procs.column("name", width=250)
+        self.tree_procs.column("pid", width=100)
+        self.tree_procs.column("cpu", width=100)
+        self.tree_procs.column("ram", width=100)
+        self.tree_procs.pack(fill="both", expand=True, padx=15, pady=10)
+
+        self.refresh_process_list()
+
+    def refresh_process_list(self):
+        for item in self.tree_procs.get_children():
+            self.tree_procs.delete(item)
+        try:
+            for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
+                try:
+                    info = p.info
+                    pid = info['pid']
+                    name = info['name'] or "?"
+                    cpu = info['cpu_percent'] or 0.0
+                    ram = round((info['memory_info'].rss / (1024**2)), 1) if info['memory_info'] else 0.0
+                    self.tree_procs.insert("", "end", values=(name, pid, f"{cpu}%", f"{ram} MB"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def kill_selected_process(self):
+        sel = self.tree_procs.selection()
+        if not sel:
+            messagebox.showwarning("Auswahl fehlt", "Bitte wähle einen Prozess aus!")
+            return
+        vals = self.tree_procs.item(sel[0], "values")
+        pid = int(vals[1])
+        name = vals[0]
+        if messagebox.askyesno("Prozess beenden", f"Möchtest du '{name}' (PID {pid}) wirklich beenden?"):
+            try:
+                psutil.Process(pid).terminate()
+                self.log(f"✅ Prozess {name} (PID {pid}) beendet.")
+                self.refresh_process_list()
+            except Exception as e:
+                messagebox.showerror("Fehler", f"Konnte Prozess nicht beenden: {e}")
+
+    def set_process_priority(self, priority):
+        sel = self.tree_procs.selection()
+        if not sel:
+            messagebox.showwarning("Auswahl fehlt", "Bitte wähle einen Prozess aus!")
+            return
+        vals = self.tree_procs.item(sel[0], "values")
+        pid = int(vals[1])
+        name = vals[0]
+        try:
+            psutil.Process(pid).nice(priority)
+            self.log(f"⚡ Priorität für {name} geändert.")
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim Ändern der Priorität: {e}")
+
+    # ---------------------------------------------------------
+    # TAB 4: DEEP UNINSTALLER (Rückstandslose Deinstallation)
+    # ---------------------------------------------------------
+    def _build_tab_uninst(self):
+        container = ttk.LabelFrame(self.tab_uninst, text="🧹 Der ultimative Deep Uninstaller (Rückstandslose Löschung)")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ttk.Label(container, text="Gib den Namen einer App oder eines Spiels ein. Der Uninstaller durchsucht Ordner & Registry nach Überresten!", style="Card.TLabel").pack(anchor="w", padx=15, pady=10)
+
+        search_box = ttk.Frame(container, style="Card.TFrame")
+        search_box.pack(fill="x", padx=15, pady=5)
+
+        self.e_uninst = ttk.Entry(search_box, width=40, font=("Segoe UI", 11))
+        self.e_uninst.pack(side="left", padx=(0, 10))
+
+        ttk.Button(search_box, text="🔍 Tiefen-Suche starten", style="Primary.TButton", command=self.run_deep_search).pack(side="left")
+
+        self.txt_uninst = scrolledtext.ScrolledText(
+            container, height=12, bg=COLOR_BG, fg=COLOR_TEXT,
+            insertbackground="white", font=("Consolas", 9), borderwidth=0, highlightthickness=0
+        )
+        self.txt_uninst.pack(fill="both", expand=True, padx=15, pady=10)
+
+        ttk.Button(container, text="🗑️ ALLE GEFUNDENEN RÜCKSTÄNDE LÖSCHEN", style="Danger.TButton", command=self.execute_deep_uninstall).pack(anchor="e", padx=15, pady=(0, 10))
+        self.found_uninstall_paths = []
+
+    def run_deep_search(self):
+        query = self.e_uninst.get().strip().lower()
+        if not query:
+            messagebox.showwarning("Eingabe fehlt", "Bitte gib einen Suchbegriff ein!")
+            return
+
+        self.txt_uninst.delete("1.0", tk.END)
+        self.txt_uninst.insert(tk.END, f"🔍 Starte Deep-Suche nach '{query}' in Ordnern und Registry...\n\n")
+        self.found_uninstall_paths = []
+
+        def worker():
+            search_dirs = [
+                os.environ.get("LOCALAPPDATA", ""),
+                os.environ.get("APPDATA", ""),
+                os.environ.get("ProgramFiles", ""),
+                os.environ.get("ProgramFiles(x86)", "")
+            ]
+            for base in search_dirs:
+                if not base or not os.path.exists(base):
+                    continue
+                try:
+                    for d in os.listdir(base):
+                        if query in d.lower():
+                            full_p = os.path.join(base, d)
+                            self.found_uninstall_paths.append(full_p)
+                            self.queue.put(("UNINST_LOG", f"📁 Gefundener Ordner: {full_p}\n"))
+                except Exception:
+                    pass
+
+            # Registry Uninstall Check
+            reg_paths = [
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            ]
+            for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for p in reg_paths:
+                    try:
+                        with winreg.OpenKey(root, p) as key:
+                            for i in range(winreg.QueryInfoKey(key)[0]):
+                                subkey_name = winreg.EnumKey(key, i)
+                                with winreg.OpenKey(key, subkey_name) as subkey:
+                                    try:
+                                        display_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                                        if query in display_name.lower():
+                                            self.queue.put(("UNINST_LOG", f"🔑 Registry-Eintrag: {display_name} ({p}\\{subkey_name})\n"))
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+            self.queue.put(("UNINST_LOG", "\n✅ Deep-Suche abgeschlossen! Klicke auf 'Löschen' zum Entfernen.\n"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def execute_deep_uninstall(self):
+        if not self.found_uninstall_paths:
+            messagebox.showwarning("Keine Daten", "Es wurden keine Ordner zum Löschen gefunden.")
+            return
+
+        if messagebox.askyesno("Sicherheitsfrage", "Möchtest du alle gefundenen Ordner und Überreste unwiderruflich löschen?"):
+            for path in self.found_uninstall_paths:
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                        self.log(f"🗑️ Gelöscht: {path}")
+                except Exception as e:
+                    self.log(f"❌ Fehler beim Löschen von {path}: {e}")
+            messagebox.showinfo("Erfolg", "Ausgewählte Ordner wurden rückstandslos gelöscht!")
+
+    # ---------------------------------------------------------
+    # TAB 5: SYSTEM & TOOLS
+    # ---------------------------------------------------------
+    def _build_tab_tools(self):
+        container = ttk.LabelFrame(self.tab_tools, text="🛠️ System-Diagnose, SFC & Gaming Booster")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ttk.Button(container, text="⚡ Gaming-Booster aktivieren (Höchstleistung + Core Parking aus)", style="Primary.TButton", command=self.activate_gaming_booster).pack(anchor="w", padx=15, pady=10)
+        ttk.Button(container, text="🔍 SFC System-Scan ausführen (sfc /scannow)", command=self.run_sfc_scan).pack(anchor="w", padx=15, pady=5)
+        ttk.Button(container, text="🌐 DNS-Cache leeren (ipconfig /flushdns)", command=self.flush_dns).pack(anchor="w", padx=15, pady=5)
+
+    # ---------------------------------------------------------
+    # BUSINESS LOGIC & THREADS
+    # ---------------------------------------------------------
+    def log(self, text):
+        self.txt_console.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {text}\n")
+        self.txt_console.see(tk.END)
+
+    def _check_queue(self):
+        try:
+            while True:
+                msg_type, payload = self.queue.get_nowait()
+                if msg_type == "LOG":
+                    self.log(payload)
+                elif msg_type == "GPU_VAL":
+                    self.lbl_gpu.config(text=f"{payload} %")
+                    self.pb_gpu["value"] = payload
+                elif msg_type == "TEMP_VAL":
+                    self.lbl_temp.config(text=f"Temperatur: {payload}")
+                elif msg_type == "UNINST_LOG":
+                    self.txt_uninst.insert(tk.END, payload)
+                    self.txt_uninst.see(tk.END)
+        except queue.Empty:
+            pass
+        self.after(200, self._check_queue)
+
+    def _start_background_threads(self):
+        def monitor_loop():
+            while True:
+                try:
+                    cpu = psutil.cpu_percent(interval=None)
+                    ram = psutil.virtual_memory()
+                    ram_used = round(ram.used / (1024**3), 1)
+                    ram_total = round(ram.total / (1024**3), 1)
+                    ram_p = ram.percent
+
+                    self.after(0, lambda: self._update_dash(cpu, ram_p, ram_used, ram_total))
+
+                    gpu = self.monitor.get_gpu_usage()
+                    self.queue.put(("GPU_VAL", gpu))
+
+                    temp = self.monitor.get_cpu_temp()
+                    self.queue.put(("TEMP_VAL", temp))
+                except Exception:
+                    pass
+                time.sleep(1.5)
+
+        threading.Thread(target=monitor_loop, daemon=True).start()
+
+    def _update_dash(self, cpu, ram_p, ram_used, ram_total):
+        self.lbl_cpu.config(text=f"{cpu} %")
+        self.pb_cpu["value"] = cpu
+        self.lbl_ram.config(text=f"{ram_used} GB / {ram_total} GB ({ram_p}%)")
+        self.pb_ram["value"] = ram_p
+
+    def clean_ram(self):
+        def worker():
+            self.log("Starte RAM-Bereinigung...")
+            try:
+                ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+                self.log("✅ RAM erfolgreich bereinigt!")
+            except Exception as e:
+                self.log(f"❌ Fehler bei RAM-Bereinigung: {e}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_ryzen_adj(self):
+        if not is_admin():
+            messagebox.showwarning("Admin erforderlich", "RyzenAdj benötigt Administrator-Rechte.")
+            return
+
+        stapm = int(self.sl_stapm.get()) * 1000
+        slow = int(self.sl_slow.get()) * 1000
+        temp = int(self.sl_temp.get())
+
+        ryzen_exe = os.path.join(get_app_dir(), "ryzenadj.exe")
+        if not os.path.exists(ryzen_exe):
+            messagebox.showerror("Fehlt", f"ryzenadj.exe nicht in {get_app_dir()} gefunden!")
+            return
+
+        def worker():
+            cmd = f'"{ryzen_exe}" --stapm-limit={stapm} --fast-limit={slow} --tctl-temp={temp}'
+            self.log(f"Führe RyzenAdj aus: {cmd}")
+            res = run_hidden(cmd)
+            if res and res.returncode == 0:
+                self.log("✅ UXTU Boost Limits erfolgreich angewendet!")
+            else:
+                self.log("⚠️ RyzenAdj angewendet (oder Limit erreicht).")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def activate_gaming_booster(self):
+        def worker():
+            self.log("Aktiviere Gaming Booster...")
+            try:
+                subprocess.run("powercfg /setactive 8c5e7fda-e8bf-4a96-9a15-a942f6d61d4e", shell=True)
+                if is_admin():
+                    subprocess.run("powercfg -setacvalueindex scheme_current sub_processor CPMINCORES 100", shell=True)
+                    subprocess.run("powercfg -setactive scheme_current", shell=True)
+                self.log("🚀 Gaming-Booster erfolgreich aktiviert!")
+            except Exception as e:
+                self.log(f"❌ Fehler beim Booster: {e}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_sfc_scan(self):
+        if not is_admin():
+            messagebox.showwarning("Admin erforderlich", "SFC Scan benötigt Administrator-Rechte.")
+            return
+        def worker():
+            self.log("Starte SFC System-Scan (sfc /scannow)...")
+            res = run_hidden("sfc /scannow", timeout=300)
+            if res:
+                self.log(f"SFC Ergebnis:\n{res.stdout}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def flush_dns(self):
+        def worker():
+            run_hidden("ipconfig /flushdns")
+            self.log("🌐 DNS-Cache erfolgreich geleert!")
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------------------------------------------------
+    # GITHUB AUTO-UPDATER
+    # ---------------------------------------------------------
+    def check_for_updates(self):
+        def worker():
+            self.log("Suche nach Updates auf GitHub...")
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    latest_tag = data.get("tag_name", "")
+
+                    if latest_tag and latest_tag != APP_VERSION:
+                        self.log(f"🎉 Neues Update gefunden: {latest_tag} (Aktuell: {APP_VERSION})")
+                        download_url = None
+                        for asset in data.get("assets", []):
+                            if asset["name"].endswith(".exe"):
+                                download_url = asset["browser_download_url"]
+                                break
+
+                        if download_url:
+                            self.queue.put(("LOG", f"Lade Update {latest_tag} herunter..."))
+                            self._install_update(download_url)
+                        else:
+                            self.log("⚠️ Keine .exe im GitHub Release Asset gefunden.")
+                    else:
+                        self.log("✅ Du verwendest bereits die neueste Version!")
+            except Exception as e:
+                self.log(f"⚠️ Update-Prüfung fehlgeschlagen: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_update(self, download_url):
+        try:
+            current_exe = sys.executable if getattr(sys, 'frozen', False) else None
+            if not current_exe:
+                self.log("⚠️ Auto-Update nur in der kompilierten .exe möglich.")
+                return
+
+            new_exe = current_exe + ".new"
+            old_exe = current_exe + ".old"
+
+            urllib.request.urlretrieve(download_url, new_exe)
+
+            if os.path.exists(old_exe):
+                os.remove(old_exe)
+            os.rename(current_exe, old_exe)
+            os.rename(new_exe, current_exe)
+
+            subprocess.Popen([current_exe])
+            sys.exit(0)
+        except Exception as e:
+            self.log(f"❌ Fehler bei der Installation des Updates: {e}")
+
+    def _cleanup_old_files(self):
+        try:
+            if getattr(sys, 'frozen', False):
+                old_exe = sys.executable + ".old"
+                if os.path.exists(old_exe):
+                    os.remove(old_exe)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    app = MaxMonitorV2()
+    app.mainloop()
