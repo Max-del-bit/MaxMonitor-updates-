@@ -1,0 +1,441 @@
+# -*- coding: utf-8 -*-
+"""
+Max Monitor V1.0 - "Clean Slate" (Windows 10/11)
+Ein sauberes, modulares System-Tool mit Admin-Elevation, Ryzen-Tuning und Auto-Updater.
+Bauen: pyinstaller --noconsole --onefile --name MaxMonitor max_monitor.py
+"""
+from __future__ import annotations
+
+import ctypes
+import json
+import logging
+import os
+import platform
+import queue
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import urllib.request
+import zipfile
+from collections import deque
+from ctypes import wintypes
+from logging.handlers import RotatingFileHandler
+from tkinter import messagebox, ttk
+
+import psutil
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+# ───────────────────────────── 1. Konfiguration & Setup ─────────────────────────────
+APP_NAME = "Max Monitor"
+VERSION = "1.0.0"
+IS_WIN = sys.platform == "win32"
+NO_WINDOW = 0x08000000 if IS_WIN else 0
+RUN_KEY, RUN_NAME = r"Software\Microsoft\Windows\CurrentVersion\Run", "MaxMonitor"
+
+# GitHub Dark Theme Farben
+BG = "#0d1117"
+PANEL = "#161b22"
+FG = "#c9d1d9"
+DIM = "#8b949e"
+ACC = "#58a6ff"
+WARN = "#d29922"
+OK = "#3fb950"
+CRIT = "#f85149"
+
+DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MaxMonitor")
+os.makedirs(DATA_DIR, exist_ok=True)
+LOG_Q = queue.Queue()
+
+class _QueueHandler(logging.Handler):
+    def emit(self, record):
+        LOG_Q.put(self.format(record))
+
+log = logging.getLogger("maxmonitor")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S")
+for _h in (RotatingFileHandler(os.path.join(DATA_DIR, "maxmonitor.log"), maxBytes=500_000, backupCount=2, encoding="utf-8"), _QueueHandler()):
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
+
+def app_dir() -> str:
+    return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+
+def run_hidden(args, timeout=10):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, encoding="oem" if IS_WIN else None, errors="replace", creationflags=NO_WINDOW)
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def elevate():
+    """Startet die App als Administrator neu."""
+    if is_admin():
+        return
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        params = " ".join(sys.argv[1:])
+    else:
+        exe = sys.executable
+        params = f'"{os.path.abspath(__file__)}" ' + " ".join(sys.argv[1:])
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        sys.exit()
+    except Exception as e:
+        messagebox.showerror(APP_NAME, f"Fehler beim Admin-Neustart: {e}")
+
+# ───────────────────── 2. Core API & Tools (RyzenAdj, Updater) ─────────────────────
+def ryzenadj_path():
+    for d in (app_dir(), DATA_DIR):
+        p = os.path.join(d, "ryzenadj.exe")
+        if os.path.isfile(p): return p
+    return None
+
+def download_ryzenadj():
+    url = "https://github.com/FlyGoat/RyzenAdj/releases/download/v0.15.0/ryzenadj-win64.zip"
+    zip_path = os.path.join(app_dir(), "ryzenadj.zip")
+    try:
+        urllib.request.urlretrieve(url, zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(app_dir())
+        os.remove(zip_path)
+        return True
+    except Exception as e:
+        return str(e)
+
+def flush_ram():
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+    before = psutil.virtual_memory().available
+    done = 0
+    for p in psutil.process_iter(["pid"]):
+        h = k32.OpenProcess(0x0100 | 0x0400, False, p.info["pid"])
+        if h:
+            if psapi.EmptyWorkingSet(h): done += 1
+            k32.CloseHandle(h)
+    time.sleep(0.5)
+    return done, max(0, psutil.virtual_memory().available - before) / 2**20
+
+def scan_defender():
+    try:
+        ps = "Get-MpComputerStatus | Select-Object -Property AntivirusEnabled, RealTimeProtectionEnabled | ConvertTo-Json"
+        r = run_hidden(["powershell", "-NoProfile", "-Command", ps], timeout=15)
+        if r.returncode == 0 and r.stdout.strip(): return json.loads(r.stdout)
+    except Exception: pass
+    return None
+
+def check_for_updates(current_version: str, update_url: str) -> tuple[bool, str]:
+    if not getattr(sys, "frozen", False):
+        return False, "Updates funktionieren nur in der kompilierten .exe!"
+    if not update_url or not update_url.startswith("https://"):
+        return False, "Ungültige Update-URL."
+    try:
+        req = urllib.request.Request(update_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            manifest = json.loads(response.read().decode('utf-8'))
+        latest_version = manifest.get("version", "0.0.0")
+        download_url = manifest.get("url", "")
+        
+        if latest_version == current_version:
+            return True, f"Du hast bereits die neueste Version ({current_version})."
+        if not download_url.startswith("https://"):
+            return False, "Download-URL im Manifest ungültig."
+            
+        exe_path = sys.executable
+        new_exe_path = exe_path + ".new"
+        
+        req_dl = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req_dl, timeout=30) as response, open(new_exe_path, 'wb') as out_file:
+            out_file.write(response.read())
+            
+        old_exe_path = exe_path + ".old"
+        if os.path.exists(old_exe_path):
+            try: os.remove(old_exe_path)
+            except OSError: pass
+                
+        os.rename(exe_path, old_exe_path)
+        os.rename(new_exe_path, exe_path)
+        
+        DETACHED_PROCESS = 0x00000008
+        subprocess.Popen([exe_path], creationflags=DETACHED_PROCESS, close_fds=True)
+        return True, "Update erfolgreich installiert. Neustart..."
+    except Exception as e:
+        return False, f"Update-Fehler: {e}"
+
+# ───────────────────── 3. Threads ─────────────────────
+class Sampler(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.halt = threading.Event()
+        self._lock = threading.Lock()
+        self._data = {}
+    def snapshot(self):
+        with self._lock: return dict(self._data)
+    def run(self):
+        psutil.cpu_percent(None); psutil.cpu_percent(percpu=True)
+        while not self.halt.wait(1.0):
+            try:
+                vm = psutil.virtual_memory()
+                d = {"cpu": psutil.cpu_percent(None), "cores": psutil.cpu_percent(percpu=True), "ram": vm.percent, "ram_used": (vm.total - vm.available) / 2**30}
+                with self._lock: self._data = d
+            except Exception: pass
+
+class Optimizer(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.halt = threading.Event()
+        self.procs = []
+    def run(self):
+        while not self.halt.wait(2.0):
+            try:
+                self.procs = [{"pid": p.info["pid"], "name": p.info["name"], "cpu": p.info["cpu_percent"], "ram": p.info["memory_info"].rss/2**20} for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]) if p.info["pid"]]
+            except Exception: pass
+    def shutdown(self): self.halt.set()
+
+# ───────────────────── 4. UI Komponenten ─────────────────────
+class Meter(tk.Frame):
+    def __init__(self, parent, title, warn=85):
+        super().__init__(parent, bg=PANEL)
+        self.warn = warn
+        tk.Label(self, text=title, bg=PANEL, fg=DIM, anchor="w", width=15).pack(side="left")
+        self.val = tk.Label(self, text="-", bg=PANEL, fg=FG, anchor="e", width=20).pack(side="right")
+        self.bar = ttk.Progressbar(self, maximum=100, style="Ok.Horizontal.TProgressbar")
+        self.bar.pack(side="left", fill="x", expand=True, padx=8)
+    def set(self, pct, text):
+        self.bar["value"] = pct or 0
+
+# ───────────────────── 5. Hauptfenster (App) ─────────────────────
+class App(tk.Tk):
+    def __init__(self, hidden=False):
+        super().__init__()
+        self.withdraw()
+        self.title(f"{APP_NAME} V{VERSION}")
+        self.geometry("1100x800")
+        self.configure(bg=BG)
+        self.ui_q = queue.Queue()
+        self.sampler = Sampler()
+        self.opt = Optimizer()
+        
+        self._build_header()
+        self._style()
+        
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=12, pady=(5, 12))
+        
+        self._tab_live()
+        self._tab_gaming()
+        self._tab_doctor()
+        self._tab_procs()
+        self._tab_settings()
+        
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.sampler.start()
+        self.opt.start()
+        
+        if hidden: self.withdraw()
+        else: self.deiconify()
+            
+        self.after(1000, self._tick)
+
+    def _build_header(self):
+        head = tk.Frame(self, bg=BG, pady=10)
+        head.pack(fill="x", padx=12)
+        tk.Label(head, text="🩺 Max Monitor", bg=BG, fg=ACC, font=("Segoe UI", 16, "bold")).pack(side="left")
+        
+        if is_admin():
+            btn = tk.Button(head, text="✅ Admin aktiv", bg=PANEL, fg=OK, relief="flat", font=("Segoe UI", 9, "bold"))
+            btn.pack(side="right")
+        else:
+            btn = tk.Button(head, text="⚠️ Als Admin neu starten", bg=PANEL, fg=WARN, relief="flat", font=("Segoe UI", 9, "bold"), command=elevate)
+            btn.pack(side="right")
+
+    def _style(self):
+        s = ttk.Style(self); s.theme_use("clam")
+        s.configure("TNotebook", background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background=PANEL, foreground=DIM, padding=(16, 8), font=("Segoe UI", 10, "bold"))
+        s.map("TNotebook.Tab", background=[("selected", "#1f2937")], foreground=[("selected", ACC)])
+        s.configure("Treeview", background=BG, fieldbackground=BG, foreground=FG, rowheight=24, borderwidth=0)
+        s.configure("Treeview.Heading", background=PANEL, foreground=FG, relief="flat")
+        s.map("Treeview", background=[("selected", ACC)], foreground=[("selected", FG)])
+        s.configure("Ok.Horizontal.TProgressbar", troughcolor=BG, background=ACC, thickness=16)
+
+    def _tab(self, title):
+        f = tk.Frame(self.nb, bg=PANEL, padx=20, pady=16)
+        self.nb.add(f, text=title)
+        return f
+
+    # --- TABS ---
+    def _tab_live(self):
+        t = self._tab("📊 Live Monitor")
+        self.m_cpu = Meter(t, "CPU Gesamt"); self.m_cpu.pack(fill="x", pady=4)
+        self.m_ram = Meter(t, "RAM"); self.m_ram.pack(fill="x", pady=4)
+        
+        tk.Label(t, text="Einzelne Kerne (Ryzen 5 2500U)", bg=PANEL, fg=DIM).pack(anchor="w", pady=(15, 5))
+        self.core_frame = tk.Frame(t, bg=PANEL); self.core_frame.pack(fill="x")
+        self.core_bars = []
+        for i in range(psutil.cpu_count() or 1):
+            b = ttk.Progressbar(self.core_frame, maximum=100, orient="vertical", length=80); b.pack(side="left", padx=2, expand=True, fill="x")
+            self.core_bars.append(b)
+
+    def _tab_gaming(self):
+        t = self._tab("🎮 Gaming-Booster")
+        tk.Label(t, text="RyzenAdj Watt-Limits (benötigt Admin)", bg=PANEL, fg=FG, font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=5)
+        
+        self.l_ryzen = tk.Label(t, text="Status: Prüfe...", bg=PANEL, fg=DIM)
+        self.l_ryzen.pack(anchor="w", pady=5)
+        
+        if not ryzenadj_path():
+            ttk.Button(t, text="RyzenAdj jetzt herunterladen", command=self._dl_ryzen).pack(anchor="w", pady=5)
+        
+        tk.Label(t, text="--- ODER MANUELL SETZEN ---", bg=PANEL, fg=DIM).pack(anchor="w", pady=10)
+        r = tk.Frame(t, bg=PANEL); r.pack(fill="x")
+        self.s_watt = tk.Scale(r, from_=5, to=65, orient="horizontal", label="Leistungslimit (Watt)", bg=PANEL, fg=FG, length=400)
+        self.s_watt.set(28)
+        self.s_watt.pack(anchor="w")
+        ttk.Button(t, text="Watt anwenden", command=self._apply_watt).pack(anchor="w", pady=5)
+        
+        tk.Label(t, text="--- SYSTEM TWEAKS ---", bg=PANEL, fg=DIM).pack(anchor="w", pady=10)
+        ttk.Button(t, text="RAM jetzt bereinigen", command=self._flush_ram).pack(anchor="w", pady=2)
+        ttk.Button(t, text="Ultimate Performance Energieplan", command=lambda: messagebox.showinfo(APP_NAME, "Wird später eingebaut (Demo)")).pack(anchor="w", pady=2)
+
+    def _dl_ryzen(self):
+        self.l_ryzen.config(text="Lade herunter...", fg=DIM)
+        def work(): return download_ryzenadj()
+        def done(res):
+            if res is True:
+                self.l_ryzen.config(text="✅ RyzenAdj erfolgreich installiert!", fg=OK)
+            else:
+                self.l_ryzen.config(text=f"❌ Fehler: {res}", fg=CRIT)
+        threading.Thread(target=lambda: self.ui_q.put(lambda: done(work())), daemon=True).start()
+
+    def _apply_watt(self):
+        if not is_admin(): return messagebox.showerror(APP_NAME, "Bitte starte die App als Admin (Button oben rechts)!")
+        exe = ryzenadj_path()
+        if not exe: return messagebox.showerror(APP_NAME, "RyzenAdj fehlt. Bitte herunterladen.")
+        
+        watt = self.s_watt.get()
+        def work():
+            try:
+                run_hidden([exe, f"--stapm-limit={watt*1000}", f"--slow-limit={watt*1000}", f"--fast-limit={watt*1000}"])
+                return "Erfolg"
+            except Exception as e:
+                return str(e)
+        def done(res):
+            if res == "Erfolg": messagebox.showinfo(APP_NAME, f"{watt}W Limit erfolgreich gesetzt!")
+            else: messagebox.showerror(APP_NAME, f"Fehler: {res}")
+        threading.Thread(target=lambda: self.ui_q.put(lambda: done(work())), daemon=True).start()
+
+    def _flush_ram(self):
+        def work(): return flush_ram()
+        def done(res):
+            n, mb = res
+            messagebox.showinfo(APP_NAME, f"{mb:.0f} MB RAM freigegeben!")
+        threading.Thread(target=lambda: self.ui_q.put(lambda: done(work())), daemon=True).start()
+
+    def _tab_doctor(self):
+        t = self._tab("🩺 Doktor")
+        tk.Label(t, text="System-Check & Virenscan", bg=PANEL, fg=FG, font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=5)
+        ttk.Button(t, text="🛡️ Defender Virencheck", command=self._scan_defender).pack(anchor="w", pady=5)
+        
+        self.txt_doc = tk.Text(t, bg=BG, fg=FG, relief="flat", font=("Consolas", 9), height=15)
+        self.txt_doc.pack(fill="both", expand=True, pady=10)
+
+    def _scan_defender(self):
+        self.txt_doc.insert("end", "> Frage Windows Defender ab...\n")
+        def work(): return scan_defender()
+        def done(res):
+            if not res: self.txt_doc.insert("end", "❌ Defender nicht lesbar (Admin nötig?).\n")
+            else: self.txt_doc.insert("end", f"✅ Antivirus: {res.get('AntivirusEnabled')} | Echtzeit: {res.get('RealTimeProtectionEnabled')}\n")
+            self.txt_doc.see("end")
+        threading.Thread(target=lambda: self.ui_q.put(lambda: done(work())), daemon=True).start()
+
+    def _tab_procs(self):
+        t = self._tab("⚙️ Prozesse")
+        self.tv = ttk.Treeview(t, columns=("name", "pid", "cpu"), show="headings")
+        for c in ("name", "pid", "cpu"): self.tv.heading(c, text=c.upper()); self.tv.column(c, width=200)
+        self.tv.pack(fill="both", expand=True)
+        ttk.Button(t, text="Ausgewählten Prozess beenden", command=self._kill_proc).pack(anchor="w", pady=10)
+
+    def _kill_proc(self):
+        sel = self.tv.selection()
+        if not sel: return
+        pid = int(self.tv.item(sel[0])["values"][1])
+        name = self.tv.item(sel[0])["values"][0]
+        if messagebox.askyesno(APP_NAME, f"{name} wirklich beenden?"):
+            try: psutil.Process(pid).terminate()
+            except Exception as e: messagebox.showerror(APP_NAME, str(e))
+
+    def _tab_settings(self):
+        t = self._tab("🔧 Einstellungen")
+        
+        tk.Label(t, text="Auto-Updater (GitHub)", bg=PANEL, fg=FG, font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=5)
+        tk.Label(t, text="URL zur latest.json:", bg=PANEL, fg=DIM).pack(anchor="w")
+        
+        self.e_url = tk.Entry(t, bg=BG, fg=FG, width=80, insertbackground=FG)
+        self.e_url.insert(0, "https://raw.githubusercontent.com/Max-del-bit/MaxMonitor-updates-/main/latest.json")
+        self.e_url.pack(anchor="w", pady=5)
+        
+        ttk.Button(t, text="Jetzt nach Updates suchen", command=self._do_update).pack(anchor="w", pady=10)
+        self.l_upd = tk.Label(t, text="Status: Bereit", bg=PANEL, fg=DIM)
+        self.l_upd.pack(anchor="w")
+
+    def _do_update(self):
+        if not getattr(sys, "frozen", False):
+            return self.l_upd.config(text="⚠️ Update funktioniert erst in der .exe!", fg=WARN)
+            
+        url = self.e_url.get().strip()
+        self.l_upd.config(text="Suche nach Updates...", fg=DIM)
+        
+        def work(): return check_for_updates(VERSION, url)
+        def done(res):
+            success, msg = res
+            if success:
+                self.l_upd.config(text=msg, fg=OK)
+                if "erfolgreich" in msg.lower() or "neustart" in msg.lower():
+                    self.quit_app()
+            else:
+                self.l_upd.config(text=f"❌ {msg}", fg=CRIT)
+        threading.Thread(target=lambda: self.ui_q.put(lambda: done(work())), daemon=True).start()
+
+    def quit_app(self):
+        self.opt.shutdown(); self.sampler.halt.set(); self.destroy()
+
+    def _tick(self):
+        try:
+            while True: self.ui_q.get_nowait()()
+        except queue.Empty: pass
+        
+        d = self.sampler.snapshot()
+        if d:
+            self.m_cpu.set(d["cpu"], f"{d['cpu']:.0f} %")
+            self.m_ram.set(d["ram"], f"{d['ram_used']:.1f} GB")
+            for b, v in zip(self.core_bars, d["cores"]): b["value"] = v
+            
+            self.tv.delete(*self.tv.get_children())
+            for p in self.opt.procs[:50]:
+                self.tv.insert("", "end", values=(p["name"], p["pid"], f"{p['cpu']:.1f}%"))
+        self.after(1000, self._tick)
+
+def main():
+    if IS_WIN:
+        try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except: pass
+    App(hidden=False).mainloop()
+
+if __name__ == "__main__":
+    main()
